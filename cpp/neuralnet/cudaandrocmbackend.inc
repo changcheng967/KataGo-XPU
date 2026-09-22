@@ -639,6 +639,8 @@ struct CudaHandles {
   bool loggedUsingCkFmha;
   // Set once the report that disableFusedAttention alone is suppressing the CK path has been logged.
   bool loggedCkFmhaDisabled;
+  // Set once the first successful decomposed rocBLAS attention call has been logged.
+  bool loggedUsingDecompAttention;
   // See the CUDA variant.
   bool loggedUsing1x1Matmul;
   // Whether 1x1 NHWC convs run as a hipBLAS GEMM instead of a MIOpen conv, already resolved
@@ -657,6 +659,7 @@ struct CudaHandles {
       loggedUsingFusedResidualNorm(false),
       loggedUsingCkFmha(false),
       loggedCkFmhaDisabled(false),
+      loggedUsingDecompAttention(false),
       loggedUsing1x1Matmul(false),
       use1x1MatmulMode(enabled_t::Auto)
   {
@@ -852,6 +855,12 @@ struct ScratchBuffers {
   // itself is allocated lazily once (its size depends only on max batch size) and then reused.
   std::unique_ptr<SizedBuf<void*>> attnBiasBuf;
   bool attnBiasBuiltThisForward = false;
+#ifdef KATAGO_GPU_HIP
+  // Decomposed rocBLAS attention scratch, sized once for the evaluator's max batch:
+  // dense Q/K/V/D [maxBatch, H, seq, headDim] plus the score matrix S [maxBatch, H, seq, seq],
+  // all half precision. Lazily allocated on first use, reused thereafter.
+  std::unique_ptr<SizedBuf<void*>> decompAttnBuf;
+#endif
 
   ScratchBuffers() = delete;
   ScratchBuffers(const ScratchBuffers&) = delete;
@@ -883,6 +892,9 @@ struct ScratchBuffers {
     //Before the allocator: ~SizedBuf hands its buffer back to the allocator, and members are
     //destroyed after this body runs.
     attnBiasBuf.reset();
+#ifdef KATAGO_GPU_HIP
+    decompAttnBuf.reset();
+#endif
     delete allocator;
     free(zeroBuf);
     free(oneBuf);
@@ -3205,10 +3217,37 @@ struct TransformerAttentionBlock {
           batchSize, seqLen, numHeads, numKVHeads, qHeadDim, vHeadDim,cudaHandles->stream);
       }
       else {
-        customCudaFlashAttention(
+#ifdef KATAGO_GPU_HIP
+        // Decomposed rocBLAS attention: on gfx906-class DCUs the batched GEMMs run 2.6-5x faster
+        // than the fused kernel's scalar-fp32 compute (about 2x end-to-end attention at head dim
+        // 64, a tie at 32; see cudaandrocmhelpers.inc). Returns false for unsupported shapes,
+        // KATAGO_ROCM_ATTN_DECOMP=0, or non-64-lane wavefronts, falling back to the fused kernel.
+        if(scratch->decompAttnBuf == nullptr) {
+          size_t decompBytes = (size_t)4 * scratch->getBufSizeXY(numHeads * qHeadDim)
+                             + (size_t)numHeads * seqLen * scratch->getBufSizeXY(1);
+          scratch->decompAttnBuf = std::make_unique<SizedBuf<void*>>(scratch->allocator, decompBytes);
+        }
+        bool decompOK = customRocmAttentionDecomposedHalf(
           (const half*)qPtr, (const half*)kPtr, (const half*)vPtr,
           (const half*)maskBuf, (half*)attnOutBuf.buf,
-          batchSize, seqLen, numHeads, numKVHeads, qHeadDim, vHeadDim,cudaHandles->stream);
+          batchSize, seqLen, numHeads, numKVHeads, qHeadDim, vHeadDim,
+          cudaHandles->stream, cudaHandles->cublas.handle,
+          scratch->oneBuf, scratch->zeroBuf, scratch->decompAttnBuf->buf);
+        if(decompOK) {
+          if(!cudaHandles->loggedUsingDecompAttention) {
+            cudaHandles->loggedUsingDecompAttention = true;
+            if(cudaHandles->logger != NULL)
+              cudaHandles->logger->write("ROCm backend: using decomposed rocBLAS attention");
+          }
+        }
+        else
+#endif
+        {
+          customCudaFlashAttention(
+            (const half*)qPtr, (const half*)kPtr, (const half*)vPtr,
+            (const half*)maskBuf, (half*)attnOutBuf.buf,
+            batchSize, seqLen, numHeads, numKVHeads, qHeadDim, vHeadDim,cudaHandles->stream);
+        }
       }
       CUDA_ERR(name.c_str(), cudaPeekAtLastError());
     }

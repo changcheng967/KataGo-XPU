@@ -3036,6 +3036,110 @@ void customCudaFlashAttention(
 #undef FA_LAUNCH_HALF
 
 //--------------------------------------------------------------------------------------------------------------
+// Decomposed attention for the ROCm backend on vector-datapath GPUs (gfx906-class DCU): instead of
+// the fused kernel above (which reaches only ~2.9 TFLOP/s because it must do scalar-fp32 FMAs from
+// fp32 LDS tiles), split attention into rocBLAS strided-batched GEMMs plus small memory-bound
+// kernels. rocBLAS measures 7.6-14.9 TFLOP/s at exactly the KataGo attention shapes (batch 16,
+// heads 12, seq 361, head dim 32/64), so the GEMMs run 2.6-5x faster than the fused compute; the
+// transposes and softmax are pure bandwidth. Best measured pipeline at tf2 shapes: 1.14 ms vs the
+// fused kernel's 1.084 ms (tie), at tf3/head-64 shapes 1.30 ms vs ~2.5+ ms fused (about 2x).
+// Launcher: customRocmAttentionDecomposedHalf in cudaandrocmbackend.inc (needs the hipblas handle,
+// which this kernels-only file does not have).
+#if defined(KATAGO_GPU_HIP)
+
+// interleave [n][pos][H*hd] -> dense [n][h][pos][hd]. One 256-thread block handles T_ROWS
+// consecutive (n,pos) rows; copies use half2 (4B) moves. Both sides coalesce along the channel axis.
+__global__ void rocmAttnTransposeToDense(const half* in, half* out,
+                                         int seq, int H, int hd, int total) {
+  const int T_ROWS = 8;
+  int nPos = blockIdx.x * T_ROWS;
+  int td = H * hd;
+  int hd2 = hd / 2;
+  for(int r = 0; r < T_ROWS; r++) {
+    int p = nPos + r;
+    if(p >= total) break;
+    const half2* src = (const half2*)(in + (size_t)p * td);
+    int pos = p % seq;
+    int n = p / seq;
+    for(int c2 = threadIdx.x; c2 < td / 2; c2 += 256) {
+      int h = c2 / hd2;
+      int d2 = c2 % hd2;
+      half2* dst = (half2*)(out + (((size_t)n * H + h) * seq + pos) * hd) + d2;
+      *dst = src[c2];
+    }
+  }
+}
+
+// dense [n][h][pos][hd] -> interleave [n][pos][H*hd]. Same multi-row scheme.
+__global__ void rocmAttnTransposeFromDense(const half* in, half* out,
+                                           int seq, int H, int hd, int total) {
+  const int T_ROWS = 8;
+  int nHp = blockIdx.x * T_ROWS;
+  int td = H * hd;
+  int hd2 = hd / 2;
+  for(int r = 0; r < T_ROWS; r++) {
+    int p = nHp + r;
+    if(p >= total) break;
+    int pos = p % seq;
+    int nh = p / seq;
+    int n = nh / H;
+    int h = nh % H;
+    half2* dst = (half2*)(out + ((size_t)n * seq + pos) * td + h * hd);
+    const half2* src = (const half2*)(in + (size_t)p * hd);
+    for(int d2 = threadIdx.x; d2 < hd2; d2 += 256)
+      dst[d2] = src[d2];
+  }
+}
+
+// Row softmax over the fp16 score matrix with key mask and scale. One 64-lane wavefront per row:
+// the row is staged in registers (<=6 floats/lane, so seqLen<=384), reductions use wavefront
+// shuffles only (no __syncthreads), global traffic is one read + one write, and exp runs once per
+// element. Masked keys are folded as -1e30 so exp underflows to exactly 0.
+// NOTE on wave size: this kernel assumes a 64-lane wavefront. That holds on the gfx906-class DCUs
+// this path targets; the whole decomposed path is HIP-only and gated on those shapes anyway.
+__global__ void rocmAttnSoftmaxWarpRow(half* S, const half* maskN,
+                                       int rowsTotal, int seq, int rowsPerN,
+                                       float scale) {
+  const int MAX_PER_LANE = 6;
+  int row = blockIdx.x;
+  int n = row / rowsPerN;
+  half* s = S + (size_t)row * seq;
+  const half* mask = maskN + (size_t)n * seq;
+  int lane = threadIdx.x;
+
+  float v[MAX_PER_LANE];
+  int cnt = 0;
+  for(int j = lane; j < seq && cnt < MAX_PER_LANE; j += 64, cnt++) {
+    float x = -1e30f;
+    if(mask[j] != (half)0.0f)
+      x = __half2float(s[j]) * scale;
+    v[cnt] = x;
+  }
+
+  float m = -1e30f;
+  for(int i = 0; i < cnt; i++) m = fmaxf(m, v[i]);
+  #pragma unroll
+  for(int off = 32; off > 0; off >>= 1)
+    m = fmaxf(m, __shfl_xor(m, off));
+
+  float sum = 0.0f;
+  for(int i = 0; i < cnt; i++) {
+    v[i] = __expf(v[i] - m);
+    sum += v[i];
+  }
+  #pragma unroll
+  for(int off = 32; off > 0; off >>= 1)
+    sum += __shfl_xor(sum, off);
+  float inv = 1.0f / sum;
+
+  cnt = 0;
+  for(int j = lane; j < seq && cnt < MAX_PER_LANE; j += 64, cnt++)
+    s[j] = __float2half(v[cnt] * inv);
+}
+
+#endif // KATAGO_GPU_HIP
+
+//--------------------------------------------------------------------------------------------------------------
 // Convert mask [batchSize, seqLen] (0/1) into a fully-materialized additive attention bias of shape
 // [batchSize, seqLen, seqLen] suitable for cuDNN SDPA's `[B, 1, S, S]` bias input.
 //   bias[b, q, k] = (mask[b, k] != 0 ? 0 : -3e4).
