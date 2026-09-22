@@ -27,6 +27,16 @@ scripts in `cpp/scripts/`.
   strongest-per-wall-clock choice on GPU** (the CPU model ranking inverts).
 - Tuner verdict: `numSearchThreads=32` + `numNNServerThreadsPerModel=2`.
 
+**MIGraphX (Hygon's TensorRT equivalent) — experimental, in progress**
+- Standalone measurement: tf2 via MIGraphX = **127.8 pos/s vs 78 pos/s for the
+  ROCm backend (+64%)** on one Z200SM_80. Backend skeleton committed
+  (`USE_BACKEND=MIGRAPHX`); full integration pending — tf3-sized models take
+  50+ min to compile and are still being investigated.
+
+*Synced with upstream KataGo through `3c144b3e` (Sept 2026), including the
+focus-playout feature — the vectorized PUCT path steps aside for it
+(`!focusPlayout` guard) and the scalar fallback applies the focus override.*
+
 ## Docs index
 
 | doc | contents |
