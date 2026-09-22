@@ -582,7 +582,7 @@ endif()
 set(BUILD_DISTRIBUTED 0 CACHE BOOL "Build with http support for contributing to distributed training")
 set(USE_BACKEND CACHE STRING "Neural net backend")
 string(TOUPPER "${USE_BACKEND}" USE_BACKEND)
-set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL ONNX ROCM)
+set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL ONNX ROCM MIGRAPHX)
 
 set(USE_TCMALLOC 0 CACHE BOOL "Use TCMalloc")
 set(NO_GIT_REVISION 0 CACHE BOOL "Disable embedding the git revision into the compiled exe")
@@ -904,6 +904,16 @@ elseif(USE_BACKEND STREQUAL "ROCM")
     neuralnet/rocmutils.cpp
     neuralnet/rocmhelpers.hip
   )
+
+elseif(USE_BACKEND STREQUAL "MIGRAPHX")
+  message(STATUS "-DUSE_BACKEND=MIGRAPHX, using MIGraphX backend (Hygon DCU).")
+  set(MIGRAPHX_ROOT "" CACHE PATH "Path to DTK/MIGraphX installation")
+  if(NOT MIGRAPHX_ROOT)
+    message(FATAL_ERROR "MIGraphX backend requires -DMIGRAPHX_ROOT=<dtk prefix>")
+  endif()
+  find_path(MIGRAPHX_INCLUDE_DIR migraphx/migraphx.h HINTS ${MIGRAPHX_ROOT}/include REQUIRED)
+  find_library(MIGRAPHX_LIBRARY NAMES migraphx_c HINTS ${MIGRAPHX_ROOT}/lib REQUIRED)
+  set(NEURALNET_BACKEND_SOURCES neuralnet/migraphxbackend.cpp)
 
 elseif(USE_BACKEND STREQUAL "")
   message(WARNING "${ColorBoldRed}WARNING: Using dummy neural net backend, intended for non-neural-net testing only, will fail on any code path requiring a neural net. To use neural net, specify -DUSE_BACKEND=CUDA or -DUSE_BACKEND=TENSORRT or -DUSE_BACKEND=OPENCL or -DUSE_BACKEND=EIGEN or -DUSE_BACKEND=ONNX or -DUSE_BACKEND=ROCM to compile with the respective backend.${ColorReset}")
