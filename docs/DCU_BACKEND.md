@@ -98,3 +98,24 @@ per-query overhead eats the batch-depth gain at 7-core feeding.
 Verdict: config-level and launch-level levers are exhausted on this box.
 The remaining lever is a deeper attention-kernel rewrite (half2-packed LDS
 tiles); everything else is at or near its measured ceiling.
+
+## MIGraphX round (DTK 26.04 / MIGraphX 5.2.0, standalone C-API bench)
+
+- **tf2-b10c384 batch=1: 127.8 pos/s** (no offload copy) / **111.6 pos/s**
+  (offload_copy=true) vs **78 pos/s** for the ROCm backend on the same GPU —
+  MIGraphX graph fusion is worth **+43-64%** even before tuning.
+- **Compile cost is the tax**: tf2 = 4.4 min, tf3-b11c768 = 50+ min (400+
+  operator shapes autotuned). Startup-time compile is fine for a long-running
+  bot; it rules out short-lived processes.
+- **Compiled-program save/load is broken on this build**: the saved `.mxr`
+  (323 MB) loads in 15 s, but `run` segfaults with a GPU VMFault — the kernel
+  dereferences a host pointer (allocation plan not restored); recompiling the
+  loaded program fails with a `code_object_op` stride mismatch. A backend must
+  compile fresh at every startup; do not ship `.mxr` caching.
+- **DTK's C API diverges from stock MIGraphX** (the C++ headers don't compile
+  — `shape` ambiguity in `raw_data.hpp`): out-params come first
+  (`migraphx_program_run(&out, prog, params)`), names differ
+  (`migraphx_onnx_options_create`, `migraphx_target_create(&t, "gpu")`,
+  `migraphx_compile_options_create`), status is the `migraphx_status` enum,
+  and `migraphx.h` needs `<functional>` included before it. All captured in
+  the backend skeleton (`cpp/neuralnet/migraphxbackend.cpp`).
