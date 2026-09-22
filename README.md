@@ -27,11 +27,15 @@ scripts in `cpp/scripts/`.
   strongest-per-wall-clock choice on GPU** (the CPU model ranking inverts).
 - Tuner verdict: `numSearchThreads=32` + `numNNServerThreadsPerModel=2`.
 
-**MIGraphX (Hygon's TensorRT equivalent) — experimental, in progress**
-- Standalone measurement: tf2 via MIGraphX = **127.8 pos/s vs 78 pos/s for the
-  ROCm backend (+64%)** on one Z200SM_80. Backend skeleton committed
-  (`USE_BACKEND=MIGRAPHX`); full integration pending — tf3-sized models take
-  50+ min to compile and are still being investigated.
+**MIGraphX (Hygon's TensorRT equivalent) — investigated, closed**
+- Full dose-response measured (batch 1/16 × fp32/fp16): at engine-relevant
+  batch=16+fp16, MIGraphX's pure-inference ceiling merely ties the ROCm
+  backend's engine actual (tf2: 569.7 vs 556; tf3: 165.3 vs 162 pos/s) —
+  **the ROCm backend stays the play path**. MIGraphX's only edge is batch=1
+  latency (+43%, single-query analysis niche). Compiled-program save/load is
+  broken on this build; every startup pays a 4-7 min compile. DTK C-API
+  quirks captured in `cpp/neuralnet/migraphxbackend.cpp` and
+  [docs/DCU_BACKEND.md](docs/DCU_BACKEND.md).
 
 *Synced with upstream KataGo through `3c144b3e` (Sept 2026), including the
 focus-playout feature — the vectorized PUCT path steps aside for it

@@ -99,19 +99,46 @@ Verdict: config-level and launch-level levers are exhausted on this box.
 The remaining lever is a deeper attention-kernel rewrite (half2-packed LDS
 tiles); everything else is at or near its measured ceiling.
 
-## MIGraphX round (DTK 26.04 / MIGraphX 5.2.0, standalone C-API bench)
+## MIGraphX round (DTK 26.04 / MIGraphX 5.2.0) — closed with a verdict
 
-- **tf2-b10c384 batch=1: 127.8 pos/s** (no offload copy) / **111.6 pos/s**
-  (offload_copy=true) vs **78 pos/s** for the ROCm backend on the same GPU —
-  MIGraphX graph fusion is worth **+43-64%** even before tuning.
-- **Compile cost is the tax**: tf2 = 4.4 min, tf3-b11c768 = 50+ min (400+
-  operator shapes autotuned). Startup-time compile is fine for a long-running
-  bot; it rules out short-lived processes.
+Standalone C-API bench + `migraphx-driver perf`, one Z200SM_80, batch as noted
+(MIGraphX numbers are pure-inference ceilings; ROCm numbers are engine
+`katago benchmark` actuals at avgBatch≈10, i.e. they already carry all
+overhead *below* their own inference ceiling):
+
+| model / config | MIGraphX | ROCm backend |
+|---|---|---|
+| tf2-b10c384, batch=1 fp32 | 111.9 pos/s | 78 pos/s |
+| tf2-b10c384, batch=1 fp16 | 110.8 pos/s | — |
+| tf2-b10c384, batch=16 fp32 | 347.6 pos/s | — |
+| tf2-b10c384, batch=16 fp16 | **569.7 pos/s** | **556 v/s** |
+| tf3-b11c768, batch=1 fp32 | 47.8 pos/s | — |
+| tf3-b11c768, batch=16 fp32 | 96.5 pos/s | — |
+| tf3-b11c768, batch=16 fp16 | **165.3 pos/s** | **162 v/s** |
+
+**Verdict: keep the ROCm backend for play/benchmark.** The initial +64%
+batch=1-vs-batch=1 comparison does not survive engine-relevant batching: at
+batch=16 with fp16, MIGraphX's *inference ceiling* merely ties the ROCm
+backend's *engine actual*, so the tuned MIOpen + custom-attention path is
+strictly ahead once the engine's batching overhead is counted on both sides.
+fp16 is mandatory to get there (fp32 loses ~2x at batch=16; batch=1 is
+latency-bound so precision doesn't matter there). MIGraphX's only real edge
+is the batch=1 latency niche (+43% over ROCm batch=1) — relevant to
+single-query analysis, not to self-play.
+
+Operational findings for any future integration:
+
+- **Compile cost on an idle GPU: tf2 = 4.4 min, tf3 = 6.6 min** (deterministic,
+  no tuning cache — the earlier "50+ min" was GPU contention from concurrent
+  work, not autotuning). Every startup pays it in full because:
 - **Compiled-program save/load is broken on this build**: the saved `.mxr`
   (323 MB) loads in 15 s, but `run` segfaults with a GPU VMFault — the kernel
   dereferences a host pointer (allocation plan not restored); recompiling the
-  loaded program fails with a `code_object_op` stride mismatch. A backend must
-  compile fresh at every startup; do not ship `.mxr` caching.
+  loaded program fails with a `code_object_op` stride mismatch. Do not ship
+  `.mxr` caching.
+- **fp16 quantization is available from the C API**
+  (`migraphx_quantize_fp16(prog)` after parse, before compile), as is batch
+  shaping (`migraphx_onnx_options_set_input_parameter_shape`).
 - **DTK's C API diverges from stock MIGraphX** (the C++ headers don't compile
   — `shape` ambiguity in `raw_data.hpp`): out-params come first
   (`migraphx_program_run(&out, prog, params)`), names differ
