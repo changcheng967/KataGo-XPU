@@ -495,6 +495,48 @@ void Search::selectBestChildToDescend(
   bestChildMoveLoc = Board::NULL_LOC;
   countEdgeVisit = true;
 
+  //A focus playout selects one of the focus moves at random in proportion to its weight. See FocusMoves in search.h.
+  //Focus moves that are illegal, avoided, or otherwise not searchable at the root get zero weight, and if none are
+  //searchable the playout is a normal one. If symmetry pruning searches an equivalent copy of the chosen move
+  //instead, that copy is the target. Analysis output reports the chosen move as a symmetry of that copy, so the
+  //focus still shows up on the requested move. The target gets a selection value above every other move, so it is
+  //chosen whenever it is selectable. If it is not, the playout falls through to the normal best move, still as a
+  //weightless and uncounted playout.
+  bool focusPlayout = false;
+  Loc focusTarget = Board::NULL_LOC;
+  if(isRoot) {
+    const FocusMoves* focus = rootFocus.load(std::memory_order_acquire);
+    if(focus != nullptr && thread.rand.nextDouble() < focus->prob) {
+      const std::vector<int>& rootAvoidMoveUntilByLoc = rootPla == P_BLACK ? avoidMoveUntilByLocBlack : avoidMoveUntilByLocWhite;
+      auto rootFocusTargetOf = [&](Loc loc) {
+        if(!rootHistory.isLegal(rootBoard,loc,rootPla))
+          return Board::NULL_LOC;
+        if(rootAvoidMoveUntilByLoc.size() > 0 && rootAvoidMoveUntilByLoc[loc] > 0)
+          return Board::NULL_LOC;
+        Loc target = rootSymRepresentativeLoc[loc];
+        if(target == Board::NULL_LOC || !isAllowedRootMove(target))
+          return Board::NULL_LOC;
+        return target;
+      };
+
+      std::vector<double>& cumWeights = thread.rootFocusCumWeightsBuf;
+      cumWeights.resize(focus->moves.size());
+      double cumWeight = 0.0;
+      for(size_t i = 0; i<focus->moves.size(); i++) {
+        if(rootFocusTargetOf(focus->moves[i]) != Board::NULL_LOC)
+          cumWeight += focus->weights[i];
+        cumWeights[i] = cumWeight;
+      }
+      if(cumWeight > 0.0) {
+        size_t idx = thread.rand.nextIndexCumulative(cumWeights.data(), cumWeights.size());
+        focusPlayout = true;
+        focusTarget = rootFocusTargetOf(focus->moves[idx]);
+        countEdgeVisit = false;
+        thread.shouldCountPlayout = false;
+      }
+    }
+  }
+
   ConstSearchNodeChildrenReference children = node.getChildren(nodeState);
   int childrenCapacity = children.getCapacity();
 
@@ -626,17 +668,17 @@ void Search::selectBestChildToDescend(
   numChildrenFound = 0;
 
   //Vectorized fast path. For any node that is not the root and has no human-SL
-  //policy and no anti-mirror adjustments, each child's selection value is the
-  //fixed PUCT expression below over three atomically-loaded stats, so we gather
-  //them and argmax with SIMD. Only worth it once the child count is large
-  //enough that the arithmetic outweighs the loads - for the young nodes (<=8
-  //children) that most descent steps hit, the gather overhead cancels the win.
-  //The root is excluded because it carries extra per-child hacks (futile-visit
-  //pruning, hintloc, wide-root noise, endgame score bonuses) with early-return
-  //values. countEdgeVisit is always true when !useHumanSL. Set KATAGO_PUCT_VEC=0
-  //to disable (A/B testing).
+  //policy and no anti-mirror adjustments and no focus playout, each child's
+  //selection value is the fixed PUCT expression below over three atomically-loaded
+  //stats, so we gather them and argmax with SIMD. Only worth it once the child
+  //count is large enough that the arithmetic outweighs the loads - for the young
+  //nodes (<=8 children) that most descent steps hit, the gather overhead cancels
+  //the win. The root is excluded because it carries extra per-child hacks
+  //(futile-visit pruning, hintloc, wide-root noise, endgame score bonuses, focus)
+  //with early-return values. countEdgeVisit is always true when !useHumanSL.
+  //Set KATAGO_PUCT_VEC=0 to disable (A/B testing).
   static const bool puctVecEnabled = puctVecEnabledByEnv();
-  if(puctVecEnabled && !useHumanSL && !antiMirror && &node != rootNode && numChildrenPresent >= 32) {
+  if(puctVecEnabled && !useHumanSL && !antiMirror && &node != rootNode && !focusPlayout && numChildrenPresent >= 32) {
     alignas(64) float vPolicy[NNPos::MAX_NN_POLICY_SIZE];
     alignas(64) double vWeight[NNPos::MAX_NN_POLICY_SIZE];
     alignas(64) double vUtility[NNPos::MAX_NN_POLICY_SIZE];
@@ -719,6 +761,8 @@ void Search::selectBestChildToDescend(
         countEdgeVisit,
         &thread
       );
+      if(focusPlayout && moveLoc == focusTarget && selectionValue > POLICY_ILLEGAL_SELECTION_VALUE)
+        selectionValue = ROOT_FOCUS_SELECTION_VALUE;
       if(selectionValue > maxSelectionValue) {
         // if(child->state.load(std::memory_order_seq_cst) == SearchNode::STATE_EVALUATING) {
         //   selectionValue -= EVALUATING_SELECTION_VALUE_PENALTY;
@@ -792,6 +836,7 @@ void Search::selectBestChildToDescend(
   //Try the new child with the best policy value
   Loc bestNewMoveLoc = Board::NULL_LOC;
   float bestNewNNPolicyProb = -1.0f;
+  bool focusTargetIsNewMove = false;
   for(int movePos = 0; movePos<policySize; movePos++) {
     bool alreadyTried = posesWithChildBuf[movePos];
     if(alreadyTried)
@@ -824,10 +869,19 @@ void Search::selectBestChildToDescend(
       maybeApplyAntiMirrorPolicy(nnPolicyProb, moveLoc, policyProbs, node.nextPla, &thread);
     }
 
+    if(focusPlayout && moveLoc == focusTarget)
+      focusTargetIsNewMove = true;
+
     if(nnPolicyProb > bestNewNNPolicyProb) {
       bestNewNNPolicyProb = nnPolicyProb;
       bestNewMoveLoc = moveLoc;
     }
+  }
+  //A focus target that is a not-yet-visited move beats every existing child and every other new move.
+  if(focusTargetIsNewMove) {
+    maxSelectionValue = ROOT_FOCUS_SELECTION_VALUE;
+    bestChildIdx = numChildrenFound;
+    bestChildMoveLoc = focusTarget;
   }
   if(bestNewMoveLoc != Board::NULL_LOC) {
     double selectionValue = getNewExploreSelectionValue(
@@ -849,7 +903,8 @@ void Search::selectBestChildToDescend(
   if(totalChildEdgeVisits >= 2 &&
      searchParams.enableMorePassingHacks &&
      thread.history.passWouldEndPhase(thread.board,thread.pla) &&
-     avoidMoveUntilByLoc.size() == 0 // Don't force playouts if there's any chance we're specifying specific moves since we don't want to force an avoided move
+     avoidMoveUntilByLoc.size() == 0 && // Don't force playouts if there's any chance we're specifying specific moves since we don't want to force an avoided move
+     !focusPlayout // Focus playouts are already forced to specific moves
   ) {
     bool hasPassMove = false;
     bool hasNonPassMove = false;
