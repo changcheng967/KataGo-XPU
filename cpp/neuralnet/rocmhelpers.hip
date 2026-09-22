@@ -59,11 +59,12 @@ bool customRocmAttentionDecomposedHalf(
     return false;
   // The softmax kernel assumes 64-lane wavefronts (true on the gfx906-class DCUs this path
   // targets); on 32-lane RDNA parts the shuffle reduction would be wrong, so fall back.
+  // (DTK's HIP calls the attribute WarpSize rather than WaveFrontWidth.)
   static const bool waveIs64 = []() {
     int dev = 0;
     int width = 0;
     if(hipGetDevice(&dev) != hipSuccess ||
-       hipDeviceGetAttribute(&width, hipDeviceAttributeWaveFrontWidth, dev) != hipSuccess)
+       hipDeviceGetAttribute(&width, hipDeviceAttributeWarpSize, dev) != hipSuccess)
       return false;
     return width == 64;
   }();

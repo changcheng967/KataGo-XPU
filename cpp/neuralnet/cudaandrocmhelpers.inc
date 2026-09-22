@@ -3102,16 +3102,16 @@ __global__ void rocmAttnSoftmaxWarpRow(half* S, const half* maskN,
                                        float scale) {
   const int MAX_PER_LANE = 6;
   int row = blockIdx.x;
-  int n = row / rowsPerN;
   half* s = S + (size_t)row * seq;
-  const half* mask = maskN + (size_t)n * seq;
+  // maskN may be NULL (no masking needed); the load below branches on that uniformly.
+  const half* mask = (maskN == NULL) ? NULL : maskN + (size_t)(row / rowsPerN) * seq;
   int lane = threadIdx.x;
 
   float v[MAX_PER_LANE];
   int cnt = 0;
   for(int j = lane; j < seq && cnt < MAX_PER_LANE; j += 64, cnt++) {
     float x = -1e30f;
-    if(mask[j] != (half)0.0f)
+    if(mask == NULL || mask[j] != (half)0.0f)
       x = __half2float(s[j]) * scale;
     v[cnt] = x;
   }

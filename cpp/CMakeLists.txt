@@ -896,6 +896,13 @@ elseif(USE_BACKEND STREQUAL "ROCM")
   enable_language(HIP)
   set(CMAKE_HIP_STANDARD 17)
 
+  # Hygon DTK's hip-clang infers a 256-thread-per-block launch bound for kernels unless told
+  # otherwise, and then aborts KataGo's 512-thread launches at runtime with "Launch params
+  # (512, 1, 1) are larger than launch bounds (256)". AMD ROCm's hip-clang defaults to 1024, so
+  # this restores the behavior the launch sites (targetNumThreads = 512) were written against.
+  # Harmless on ROCm proper (it only raises a cap).
+  set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} --gpu-max-threads-per-block=1024" CACHE STRING "" FORCE)
+
   # rocmbackend.cpp, rocmutils.cpp, and rocmhelpers.hip are thin wrappers around
   # cudaandrocmbackend.inc, cudaandrocmutils.inc, and cudaandrocmhelpers.inc, which are shared
   # with the CUDA backend (tracked via compiler depfiles, so they do not appear here).
