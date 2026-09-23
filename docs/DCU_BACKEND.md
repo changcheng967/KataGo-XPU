@@ -115,14 +115,17 @@ overhead *below* their own inference ceiling):
 | tf3-b11c768, batch=1 fp32 | 47.8 pos/s | — |
 | tf3-b11c768, batch=16 fp32 | 96.5 pos/s | — |
 | tf3-b11c768, batch=16 fp16 | **165.3 pos/s** | **162 v/s** |
+| tf3, batch=16 fp16, exhaustive-tune | 179.9 pos/s | — |
+| tf3, batch=16, decomposed-attention era | (ceiling 179.9) | **208 v/s engine actual** |
 
-**Verdict: keep the ROCm backend for play/benchmark.** The initial +64%
-batch=1-vs-batch=1 comparison does not survive engine-relevant batching: at
-batch=16 with fp16, MIGraphX's *inference ceiling* merely ties the ROCm
-backend's *engine actual*, so the tuned MIOpen + custom-attention path is
-strictly ahead once the engine's batching overhead is counted on both sides.
-fp16 is mandatory to get there (fp32 loses ~2x at batch=16; batch=1 is
-latency-bound so precision doesn't matter there). MIGraphX's only real edge
+**Verdict: keep the ROCm backend for play/benchmark — now with the decomposed
+rocBLAS attention (see the next section), it isn't close.** The initial +64%
+batch=1-vs-batch=1 comparison did not survive engine-relevant batching; even
+with `--exhaustive-tune` (179.9 pos/s, +8.9% over untuned), MIGraphX's best-case
+*inference ceiling* sits 16% below what the decomposed-attention ROCm engine
+actually delivers end-to-end (208 v/s) on the same model. fp16 is mandatory to
+get anywhere (fp32 loses ~2x at batch=16; batch=1 is latency-bound so precision
+doesn't matter there). MIGraphX's only real edge
 is the batch=1 latency niche (+43% over ROCm batch=1) — relevant to
 single-query analysis, not to self-play.
 
