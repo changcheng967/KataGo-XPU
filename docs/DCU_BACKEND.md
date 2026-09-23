@@ -146,3 +146,43 @@ Operational findings for any future integration:
   `migraphx_compile_options_create`), status is the `migraphx_status` enum,
   and `migraphx.h` needs `<functional>` included before it. All captured in
   the backend skeleton (`cpp/neuralnet/migraphxbackend.cpp`).
+
+## Decomposed rocBLAS attention: 3.3x engine-level (Sept 2026)
+
+The fused flash-attention kernel was the bound all along: it computes
+scalar-fp32 FMAs from fp32 LDS tiles and reaches only ~2.9 TFLOP/s, while
+rocBLAS strided-batched GEMMs at exactly the KataGo attention shapes
+(batch 16 × 12 heads × seq 361, head dim 32/64) run at **7.6-14.9 TFLOP/s**
+(hd=64 AV hits 86% of the fp16 peak). gfx906 has no MFMA, so the usual
+fused-kernel rationale (feed the tensor cores) does not apply — splitting
+attention into GEMMs wins.
+
+Pipeline (HIP-only path in `cudaandrocmhelpers.inc`, launcher in
+`rocmhelpers.hip`, dispatch in `cudaandrocmbackend.inc`; env
+`KATAGO_ROCM_ATTN_DECOMP=0` to disable; automatic per-shape fallback to the
+fused kernel):
+
+1. interleave→dense transposes for Q/K/V (half2 moves, multi-row blocks),
+2. `hipblasHgemmStridedBatched` QK^T (column-major mapping: `S^T = K·Q^T`),
+3. warp-per-row masked softmax — row staged in registers (≤6 floats/lane),
+   shuffle-only reductions, one global read + one write, `__expf` once,
+4. `hipblasHgemmStridedBatched` AV (`D^T = V^T·S'^T`),
+5. dense→interleave transpose back.
+
+Engine A/B, same pod, 32 threads, b11c768-s11750 (the CGOS bot's model),
+800 visits, reproducible across reruns:
+
+| path | visits/s | nnEvals/s | avgBatch |
+|---|---|---|---|
+| fused kernel | 61.9-62.7 | — | — |
+| **decomposed** | **207.9-208.1** | 185.9 | 10.2 |
+
+**3.35x.** Numerics: identical move orderings on fixed positions; priors
+within 2-7% relative — fp16-rounding scale, the same class of drift as the
+cuDNN-SDPA vs plain-kernel divergence on CUDA.
+
+DTK quirks fixed along the way (all in-repo now): `maskBuf` may be NULL at
+the attention call site; the wave-size attribute is `WarpSize`, not
+`WaveFrontWidth`; and DTK's hip-clang infers a 256-thread launch bound and
+aborts KataGo's 512-thread launches at runtime — the ROCm CMake path now
+passes `--gpu-max-threads-per-block=1024` (AMD ROCm already defaults there).
