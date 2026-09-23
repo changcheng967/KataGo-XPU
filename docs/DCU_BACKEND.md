@@ -189,3 +189,16 @@ the attention call site; the wave-size attribute is `WarpSize`, not
 `WaveFrontWidth`; and DTK's hip-clang infers a 256-thread launch bound and
 aborts KataGo's 512-thread launches at runtime — the ROCm CMake path now
 passes `--gpu-max-threads-per-block=1024` (AMD ROCm already defaults there).
+
+Two-GPU confirmation (same pod pair as the bot, 32 search threads, b16):
+
+| config | visits/s |
+|---|---|
+| fused, 4 NN threads (2/GPU) | 110.8 |
+| **decomposed, 4 NN threads (2/GPU)** | **377.6** |
+| decomposed, 2 NN threads (1/GPU) | 380.6 |
+| decomposed, 2 NN threads, nnMaxBatchSize=32 | 373.5 |
+
+**3.41x on both GPUs** (1.82x over the single-GPU 208 — the 7-core quota is
+the shared feeding limit). NN-thread count and max batch make no difference
+post-decomposition; the bot's existing 4-thread config stands.
