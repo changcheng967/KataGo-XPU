@@ -202,3 +202,11 @@ Two-GPU confirmation (same pod pair as the bot, 32 search threads, b16):
 **3.41x on both GPUs** (1.82x over the single-GPU 208 — the 7-core quota is
 the shared feeding limit). NN-thread count and max batch make no difference
 post-decomposition; the bot's existing 4-thread config stands.
+
+v3 kernel round (padded S stride + half2 softmax IO + 8B transpose moves):
+attention pipeline 1.290 -> 1.199 ms at tf3 shapes, but the engine stays in
+the same 369-383 v/s band — attention is no longer the dominant term, so
+kernel gains beyond this point are absorbed by the trunk GEMMs/convs and the
+14-core CPU feeding. Best measured 2-GPU number: **382.9 v/s**. Build notes
+for a fresh pod: GitHub tarball sources need -DNO_GIT_REVISION=1, and the
+image needs the librt->libc symlink before linking.
