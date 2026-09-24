@@ -10,7 +10,7 @@
 // Decomposed fp16 attention via rocBLAS batched GEMMs (see rocmhelpers.hip and the kernels in
 // cudaandrocmhelpers.inc). Returns false when the shape is unsupported (caller falls back to the
 // fused kernel) or KATAGO_ROCM_ATTN_DECOMP=0. scratchMem must hold
-//   4*batchSize*seqLen*numHeads*headDim + batchSize*numHeads*seqLen*seqLen  halfs.
+//   4*batchSize*seqLen*numHeads*headDim + batchSize*numHeads*seqLen*((seqLen+7)&~7)  halfs.
 bool customRocmAttentionDecomposedHalf(
   const half* Q, const half* K, const half* V, const half* mask, half* output,
   int batchSize, int seqLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim,

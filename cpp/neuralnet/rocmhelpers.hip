@@ -27,7 +27,7 @@
 //
 // Returns false for shapes this path does not handle (the caller falls back to
 // customCudaFlashAttention) and when KATAGO_ROCM_ATTN_DECOMP=0. scratchMem must hold
-//   4*batchSize*seqLen*numHeads*headDim + batchSize*numHeads*seqLen*seqLen
+//   4*batchSize*seqLen*numHeads*headDim + batchSize*numHeads*seqLen*((seqLen+7)&~7)
 // halfs; the backend sizes it for the evaluator's max batch so it is allocated once.
 // Error checks throw rather than using CUBLAS_ERR, honoring the helpers-file contract of not
 // pulling in rocmerrorcheck.h (which would redefine CUDA_ERR/CUBLAS_ERR in this TU).
@@ -73,8 +73,11 @@ bool customRocmAttentionDecomposedHalf(
 
   int bh = batchSize * numHeads;
   int td = numHeads * qHeadDim;
+  // Pad the score-matrix row stride to a multiple of 8 halves so every row starts
+  // 4B-aligned; the softmax then does half2 IO and the GEMMs take it as ldc/stride.
+  int rowStride = (seqLen + 7) & ~7;
   size_t densePerHeadElems = (size_t)bh * seqLen * qHeadDim;
-  size_t sElems = (size_t)bh * seqLen * seqLen;
+  size_t sElems = (size_t)bh * seqLen * rowStride;
 
   half* Qd = (half*)scratchMem;
   half* Kd = Qd + densePerHeadElems;
@@ -82,6 +85,7 @@ bool customRocmAttentionDecomposedHalf(
   half* Dd = Vd + densePerHeadElems;
   half* S = Dd + densePerHeadElems;
   (void)td;
+  (void)sElems;
 
   int rowsIn = (batchSize * seqLen + 7) / 8;
   int rowsOut = (bh * seqLen + 7) / 8;
@@ -100,19 +104,19 @@ bool customRocmAttentionDecomposedHalf(
     seqLen, seqLen, qHeadDim,
     alpha, (const hipblasHalf*)Kd, qHeadDim, strideQKV,
     (const hipblasHalf*)Qd, qHeadDim, strideQKV,
-    beta, (hipblasHalf*)S, seqLen, (long long)seqLen * seqLen, bh);
+    beta, (hipblasHalf*)S, rowStride, (long long)seqLen * rowStride, bh);
   if(st != HIPBLAS_STATUS_SUCCESS)
     throw std::runtime_error("customRocmAttentionDecomposedHalf: QK^T hipblasHgemmStridedBatched failed");
 
   float scale = 1.0f / sqrtf((float)qHeadDim);
   rocmAttnSoftmaxWarpRow<<<bh * seqLen, 64, 0, stream>>>(
-    S, mask, bh * seqLen, seqLen, numHeads * seqLen, scale);
+    S, mask, bh * seqLen, seqLen, rowStride, numHeads * seqLen, scale);
 
   st = cublasHgemmStridedBatched(
     blasHandle, HIPBLAS_OP_N, HIPBLAS_OP_N,
     vHeadDim, seqLen, seqLen,
     alpha, (const hipblasHalf*)Vd, vHeadDim, (long long)seqLen * vHeadDim,
-    (const hipblasHalf*)S, seqLen, (long long)seqLen * seqLen,
+    (const hipblasHalf*)S, rowStride, (long long)seqLen * rowStride,
     beta, (hipblasHalf*)Dd, vHeadDim, (long long)seqLen * vHeadDim, bh);
   if(st != HIPBLAS_STATUS_SUCCESS)
     throw std::runtime_error("customRocmAttentionDecomposedHalf: AV hipblasHgemmStridedBatched failed");

@@ -3223,8 +3223,10 @@ struct TransformerAttentionBlock {
         // 64, a tie at 32; see cudaandrocmhelpers.inc). Returns false for unsupported shapes,
         // KATAGO_ROCM_ATTN_DECOMP=0, or non-64-lane wavefronts, falling back to the fused kernel.
         if(scratch->decompAttnBuf == nullptr) {
+          // S uses the padded row stride ((seqLen+7)&~7) so softmax rows are 4B-aligned.
+          int rowStride = (seqLen + 7) & ~7;
           size_t decompBytes = (size_t)4 * scratch->getBufSizeXY(numHeads * qHeadDim)
-                             + (size_t)numHeads * seqLen * scratch->getBufSizeXY(1);
+                             + (size_t)numHeads * rowStride * scratch->getBufSizeXY(1);
           scratch->decompAttnBuf = std::make_unique<SizedBuf<void*>>(scratch->allocator, decompBytes);
         }
         bool decompOK = customRocmAttentionDecomposedHalf(
