@@ -1858,6 +1858,32 @@ struct MatMulLayer {
       //FP16 in/out and FP32 compute fixes that and costs nothing in speed. alpha/beta must match
       //the compute type, so they are plain host floats here rather than the half zeroBuf/oneBuf
       //the CUDA path uses.
+      //KATAGO_ROCM_TRUNK_FP16ACC=1 opts back into fp16-compute Hgemm anyway: on gfx906-class DCUs
+      //packed-fp16 FMA runs ~2x the fp32-compute rate, so the trunk GEMMs (the dominant remaining
+      //cost after the decomposed-attention work) speed up materially. Accuracy must be A/B-checked
+      //(see docs/DCU_BACKEND.md) before trusting it for play.
+      static const bool trunkFp16Acc = []() {
+        const char* e = std::getenv("KATAGO_ROCM_TRUNK_FP16ACC");
+        return e != NULL && std::string(e) == "1";
+      }();
+      if(trunkFp16Acc) {
+        const cublas_half_t* alpha = (const cublas_half_t*)scratch->oneBuf;
+        const cublas_half_t* beta = (const cublas_half_t*)(accumulate ? scratch->oneBuf : scratch->zeroBuf);
+        CUBLAS_ERR(name.c_str(),cublasHgemm(
+          cudaHandles->cublas,
+          CUBLAS_OP_N,
+          CUBLAS_OP_N,
+          outChannels,
+          batchSize,
+          inChannels,
+          alpha,
+          (const cublas_half_t*)matBuf.buf,outChannels,
+          (const cublas_half_t*)inputBuf,inChannels,
+          beta,
+          (cublas_half_t*)outputBuf,outChannels
+        ));
+      }
+      else {
       const float alpha = 1.0f;
       const float beta = accumulate ? 1.0f : 0.0f;
       CUBLAS_ERR(name.c_str(),hipblasGemmEx(
@@ -1895,6 +1921,7 @@ struct MatMulLayer {
         (cublas_half_t*)outputBuf,outChannels
       ));
 #endif
+      }
     }
 
   }
@@ -1942,7 +1969,31 @@ static void applySharedInputStridedMatMuls(
   }
   else {
 #if defined(KATAGO_GPU_HIP) && defined(hipblasVersionMajor) && hipblasVersionMajor >= 2
-    //FP32 compute for accuracy, same reasoning as in MatMulLayer::apply.
+    //FP32 compute for accuracy, same reasoning as in MatMulLayer::apply. KATAGO_ROCM_TRUNK_FP16ACC=1
+    //switches to fp16-compute HgemmStridedBatched for the gfx906 packed-fp16 rate (see apply).
+    static const bool trunkFp16AccB = []() {
+      const char* e = std::getenv("KATAGO_ROCM_TRUNK_FP16ACC");
+      return e != NULL && std::string(e) == "1";
+    }();
+    if(trunkFp16AccB) {
+      const cublas_half_t* alpha = (const cublas_half_t*)scratch->oneBuf;
+      const cublas_half_t* beta = (const cublas_half_t*)scratch->zeroBuf;
+      CUBLAS_ERR(name.c_str(),cublasHgemmStridedBatched(
+        cudaHandles->cublas,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        outChannels,
+        batchSize,
+        inChannels,
+        alpha,
+        (const cublas_half_t*)packedWeights, outChannels, weightStrideElts,
+        (const cublas_half_t*)inputBuf, inChannels, 0LL,
+        beta,
+        (cublas_half_t*)outputBuf, outChannels, outputStrideElts,
+        count
+      ));
+    }
+    else {
     const float alpha = 1.0f;
     const float beta = 0.0f;
     CUBLAS_ERR(name.c_str(),hipblasGemmStridedBatchedEx(
@@ -1961,6 +2012,7 @@ static void applySharedInputStridedMatMuls(
       HIPBLAS_COMPUTE_32F,
       HIPBLAS_GEMM_DEFAULT
     ));
+    }
 #else
     const cublas_half_t* alpha = (const cublas_half_t*)scratch->oneBuf;
     const cublas_half_t* beta = (const cublas_half_t*)scratch->zeroBuf;
