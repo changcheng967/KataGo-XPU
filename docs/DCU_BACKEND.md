@@ -210,3 +210,14 @@ kernel gains beyond this point are absorbed by the trunk GEMMs/convs and the
 14-core CPU feeding. Best measured 2-GPU number: **382.9 v/s**. Build notes
 for a fresh pod: GitHub tarball sources need -DNO_GIT_REVISION=1, and the
 image needs the librt->libc symlink before linking.
+
+Trunk fp16-accumulate round (opt-in, `KATAGO_ROCM_TRUNK_FP16ACC=1`): the
+trunk projection/FFN GEMMs default to fp32-accumulate per upstream's
+accuracy testing; on gfx906 that halves the packed-fp16 FMA rate. The
+env-gated Hgemm variant runs them fp16-accumulate: **2-GPU 383 -> 407-412
+v/s** (best 411.9). A/B numerics on a fixed position: top prior drifts
+3.3%, most moves <1%, root winrate 0.4% — the same fp16-noise class as the
+attention swap. It would NOT pass upstream's backend accuracy test (that is
+why it is opt-in), but is within normal fp16-inference variation for play.
+Stack summary on one pod pair (2 DCUs, 14-core quota): fused 110.8 ->
+decomposed attention 383 -> +trunk fp16 412 = **3.7x total**.
