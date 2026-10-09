@@ -221,3 +221,17 @@ attention swap. It would NOT pass upstream's backend accuracy test (that is
 why it is opt-in), but is within normal fp16-inference variation for play.
 Stack summary on one pod pair (2 DCUs, 14-core quota): fused 110.8 ->
 decomposed attention 383 -> +trunk fp16 412 = **3.7x total**.
+
+Transpose/softmax optimization round (probe results, gfx906): the promising
+"write QKV per-head-dense directly from the GEMM" elimination is NOT
+expressible — rocBLAS strided-batched requires uniform strides, and the
+input tensor is shared across heads while outputs fan out per (batch, head),
+so the only forms are 48 small GEMM calls per block (launch- and
+tile-inefficiency make it a net loss) or the existing transposes. Measured:
+each v3 transpose costs only 57 us (3 = 172 us of the 1.2 ms attention op,
+2.2x the 26 us bandwidth floor); an LDS-tiled variant measured 3x WORSE
+(0.170 ms). Remaining kernel headroom across transposes+softmax sums to
+~3-5% engine — documented as diminishing. Alignment note: mask rows at odd
+n are only 2B-aligned, so half2 mask reads fault; the production kernel
+already reads the mask scalar-wise (this is why the score matrix uses the
+padded row stride instead).
